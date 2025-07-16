@@ -631,6 +631,11 @@ void VectorLayout::print(Stream& os) const {
     os << ",-2";
   }
 }
+template void VectorLayout::print<std::ostream>(std::ostream& param) const;
+template void VectorLayout::print<llvm::raw_ostream>(
+    llvm::raw_ostream& os) const;
+template void VectorLayout::print<mlir::Diagnostic>(
+    mlir::Diagnostic& diag) const;
 
 std::optional<VectorLayout> VectorLayout::join(const VectorLayout& l,
                                                const VectorLayout& r,
