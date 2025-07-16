@@ -179,29 +179,27 @@ class LayoutInferenceTest(parameterized.TestCase, metaclass=LayoutInferenceTestM
     self.assertEmpty(c.attributes["in_layouts"])
     self.checkOutLayouts(c, [layout])
 
-  @parameterized.parameters(True, False)
-  def test_infer_splat_layout_for_vector_splat(self, rhs_splat):
+  def test_infer_splat_layout_for_vector_splat(self):
     shape = (16, 8)
-    layout = layouts.to_layout_attr(mgpu.WGSplatFragLayout(shape=shape))
+    splat_layout = layouts.to_layout_attr(mgpu.WGSplatFragLayout(shape=shape))
     with ir.InsertionPoint(self.module.body):
       bf16 = ir.BF16Type.get()
       ty = ir.VectorType.get(shape, bf16)
       lhs, rhs = undefs(bf16, ty)
-      rhs = layout_cast(rhs, layout) if rhs_splat else rhs
       splat = vector.SplatOp(rhs.type, lhs)
       add = arith.AddFOp(splat.result, rhs)
 
     self.infer_layout(self.module)
 
     self.assertEmpty(splat.attributes["in_layouts"])
-    self.checkOutLayouts(splat, [layout])
+    self.checkOutLayouts(splat, [splat_layout])
 
-    add_layout = layout if rhs_splat else layouts.to_layout_attr(
+    strided_layout = layouts.to_layout_attr(
         mgpu.WGStridedFragLayout.from_shaped_type(ty)
     )
 
-    self.checkInLayouts(add, [add_layout, add_layout])
-    self.checkOutLayouts(add, [add_layout])
+    self.checkInLayouts(add, [strided_layout, strided_layout])
+    self.checkOutLayouts(add, [strided_layout])
 
   @parameterized.parameters(
       mgpu.WGSplatFragLayout(shape=(32, 4)),
@@ -520,10 +518,15 @@ def _undef_equation_system(
 ) -> tuple[eqns.EquationSystem, layout_inference2.OperandOrResultsForVariable]:
   # This rule is only called if the single output of the undef op is a vector,
   # so we can just return a trivial mapping.
-  result = layout_inference2.OperandOrResult(
-      op, layout_inference2.VariableType.RESULT, 0
+  result = eqns.Variable(
+      layout_inference2.OperandOrResult(
+          op, layout_inference2.VariableType.RESULT, 0
+      )
   )
-  return eqns.EquationSystem(), {eqns.Variable(result): [result]}
+  is_not_splat = eqns.Distinct(
+      result, eqns.Constant(mgpu.WGSplatFragLayout(tuple(op.result.type.shape)))
+  )
+  return eqns.EquationSystem(constraints=[is_not_splat]), {result: [result.key]}
 
 
 class LayoutInferenceTestEquations(LayoutInferenceTest, inference_impl=InferenceImplementation.EQUATIONS):
@@ -542,7 +545,7 @@ class LayoutInferenceTestEquations(LayoutInferenceTest, inference_impl=Inference
         llvm.UndefOp.OPERATION_NAME
     ]
 
-  def test_hint_extraction_works_correctly(self):
+  def test_hint_and_constraint_extraction_works_correctly(self):
     layout = mgpu.WGMMA_ROW_LAYOUT
     with ir.InsertionPoint(self.module.body):
       x = llvm.UndefOp(ir.VectorType.get((64,), ir.BF16Type.get()))
@@ -551,12 +554,16 @@ class LayoutInferenceTestEquations(LayoutInferenceTest, inference_impl=Inference
     x_system, x_mapping = _undef_equation_system(x)
     lc_system, lc_mapping = layout_inference2._layout_cast_equation_system(lc)
     assignments = x_system.assignments | lc_system.assignments
-    [hint_cst] = layout_inference2.reduce_hints(
-        layout_inference2.derive_hints(x_mapping | lc_mapping), assignments
+    hints, [constraint] = layout_inference2.derive_hints_and_constraints(
+        x_mapping | lc_mapping
     )
+    [hint_cst] = layout_inference2.reduce_hints(hints, assignments)
 
-    self.assertEqual(hint_cst.variable.key.operation, x)
+    [x_variable] = x_mapping.keys()
+    [lc_variable] = lc_mapping.keys()
+    self.assertEqual(hint_cst.variable, x_variable)
     self.assertEqual(hint_cst.expression, C(layout))
+    self.assertEqual(constraint, eqns.Relayout(x_variable, lc_variable))
 
   def test_unambiguous_hints_are_used_to_assign_variables_correctly(self):
     v0 = V(0)
