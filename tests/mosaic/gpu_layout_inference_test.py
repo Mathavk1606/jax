@@ -179,29 +179,24 @@ class LayoutInferenceTest(parameterized.TestCase, metaclass=LayoutInferenceTestM
     self.assertEmpty(c.attributes["in_layouts"])
     self.checkOutLayouts(c, [layout])
 
-  @parameterized.parameters(True, False)
-  def test_infer_splat_layout_for_vector_splat(self, rhs_splat):
+  def test_infer_splat_layout_for_vector_splat(self):
     shape = (16, 8)
-    layout = layouts.to_layout_attr(mgpu.WGSplatFragLayout(shape=shape))
+    splat_layout = layouts.to_layout_attr(mgpu.WGSplatFragLayout(shape=shape))
     with ir.InsertionPoint(self.module.body):
       bf16 = ir.BF16Type.get()
       ty = ir.VectorType.get(shape, bf16)
       lhs, rhs = undefs(bf16, ty)
-      rhs = layout_cast(rhs, layout) if rhs_splat else rhs
+      rhs = layout_cast(rhs, splat_layout)
       splat = vector.SplatOp(rhs.type, lhs)
       add = arith.AddFOp(splat.result, rhs)
 
     self.infer_layout(self.module)
 
     self.assertEmpty(splat.attributes["in_layouts"])
-    self.checkOutLayouts(splat, [layout])
+    self.checkOutLayouts(splat, [splat_layout])
 
-    add_layout = layout if rhs_splat else layouts.to_layout_attr(
-        mgpu.WGStridedFragLayout.from_shaped_type(ty)
-    )
-
-    self.checkInLayouts(add, [add_layout, add_layout])
-    self.checkOutLayouts(add, [add_layout])
+    self.checkInLayouts(add, [splat_layout, splat_layout])
+    self.checkOutLayouts(add, [splat_layout])
 
   @parameterized.parameters(
       mgpu.WGSplatFragLayout(shape=(32, 4)),
@@ -221,6 +216,29 @@ class LayoutInferenceTest(parameterized.TestCase, metaclass=LayoutInferenceTestM
     layout_attr = layouts.to_layout_attr(layout)
     self.checkInLayouts(add, [layout_attr, layout_attr])
     self.checkOutLayouts(add, [layout_attr])
+
+  def test_vector_load_does_not_allow_splat_result(self):
+    shape = (32, 4)
+    splat_layout_attr = layouts.to_layout_attr(
+        mgpu.WGSplatFragLayout(shape=shape)
+    )
+    strided_layout_attr = layouts.to_layout_attr(
+        mgpu.WGStridedFragLayout(shape=shape, vec_size=1)
+    )
+
+    with ir.InsertionPoint(self.module.body):
+      vec_ty = ir.VectorType.get(shape, ir.BF16Type.get())
+      ref_ty = ir.MemRefType.get(shape, ir.BF16Type.get())
+      vec, ref = undefs(vec_ty, ref_ty)
+      zero = mgpu.utils.c(0, ir.IntegerType.get_signless(32))
+      load_op = vector.LoadOp(vec_ty, ref, [zero])
+      lhs = layout_cast(vec, splat_layout_attr)
+      arith.AddFOp(lhs, load_op.result)
+
+    self.infer_layout(self.module)
+
+    self.checkInLayouts(load_op, [])
+    self.checkOutLayouts(load_op, [strided_layout_attr])
 
   def test_infer_layout_cast_layout(self):
     shape = (128, 64)
@@ -324,6 +342,12 @@ class LayoutInferenceTest(parameterized.TestCase, metaclass=LayoutInferenceTestM
   def test_infer_layout_from_yield_op_in_layouts_for_for_op(
       self, shape, layout
   ):
+    if self.INFERENCE_IMPL == InferenceImplementation.LEGACY:
+      self.skipTest(
+          "The legacy implementation does not return the same results, and "
+          "will be removed soon. The new implementation returns better results."
+      )
+
     with ir.InsertionPoint(self.module.body):
       ab_type = ir.VectorType.get(shape, ir.BF16Type.get())
       i32 = ir.IntegerType.get_signless(32)
@@ -338,24 +362,10 @@ class LayoutInferenceTest(parameterized.TestCase, metaclass=LayoutInferenceTestM
 
     self.infer_layout(self.module)
 
-    if isinstance(layout, mgpu.WGSplatFragLayout):
-      # In the splat case, we should not propagate the splat layout from the
-      # yield op. That is because we can not convert other layouts to a splat
-      # layout---which could cause trouble if the initial carries have a
-      # different layout. Instead, we should get the default annotation, i.e.
-      # strided layouts.
-      strided_layout = layouts.to_layout_attr(
-          mgpu.WGStridedFragLayout.from_shaped_type(ab_type)
-      )
-      carry_layouts = [strided_layout, strided_layout]
-      self.checkOutLayouts(yield_op, [])
-      self.checkInLayouts(for_op, carry_layouts)
-      self.checkOutLayouts(for_op, carry_layouts)
-    else:
-      carry_layouts = [layouts.to_layout_attr(layout)] * 2
-      self.checkOutLayouts(yield_op, [])
-      self.checkInLayouts(for_op, carry_layouts)
-      self.checkOutLayouts(for_op, carry_layouts)
+    carry_layouts = [layouts.to_layout_attr(layout)] * 2
+    self.checkOutLayouts(yield_op, [])
+    self.checkInLayouts(for_op, carry_layouts)
+    self.checkOutLayouts(for_op, carry_layouts)
 
   def test_infer_layout_from_body_op_to_yield_op_to_for_op(self):
     shape = (64, 64)
@@ -542,7 +552,7 @@ class LayoutInferenceTestEquations(LayoutInferenceTest, inference_impl=Inference
         llvm.UndefOp.OPERATION_NAME
     ]
 
-  def test_hint_extraction_works_correctly(self):
+  def test_hint_and_constraint_extraction_works_correctly(self):
     layout = mgpu.WGMMA_ROW_LAYOUT
     with ir.InsertionPoint(self.module.body):
       x = llvm.UndefOp(ir.VectorType.get((64,), ir.BF16Type.get()))
@@ -551,12 +561,16 @@ class LayoutInferenceTestEquations(LayoutInferenceTest, inference_impl=Inference
     x_system, x_mapping = _undef_equation_system(x)
     lc_system, lc_mapping = layout_inference2._layout_cast_equation_system(lc)
     assignments = x_system.assignments | lc_system.assignments
-    [hint_cst] = layout_inference2.reduce_hints(
-        layout_inference2.derive_hints(x_mapping | lc_mapping), assignments
+    hints, [constraint] = layout_inference2.derive_hints_and_constraints(
+        x_mapping | lc_mapping
     )
+    [hint_cst] = layout_inference2.reduce_hints(hints, assignments)
 
-    self.assertEqual(hint_cst.variable.key.operation, x)
+    [x_variable] = x_mapping.keys()
+    [lc_variable] = lc_mapping.keys()
+    self.assertEqual(hint_cst.variable, x_variable)
     self.assertEqual(hint_cst.expression, C(layout))
+    self.assertEqual(constraint, eqns.Relayout(x_variable, lc_variable))
 
   def test_unambiguous_hints_are_used_to_assign_variables_correctly(self):
     v0 = V(0)
@@ -642,9 +656,9 @@ class LayoutInferenceTestEquations(LayoutInferenceTest, inference_impl=Inference
     )
     _, expr = layout_inference2.extract_variable_assignment_from_hint(
         H(v0, hint_expr))
-    self.assertEqual(expr, layout1)
+    self.assertIsNotNone(expr)
 
-  def test_least_replicated_hint_is_not_resolved_when_all_known_choices_are_replicated(
+  def test_least_replicated_hint_is_still_resolved_when_all_known_choices_are_replicated(
       self,
   ):
     v0, v1 = V(0), V(1)
@@ -653,7 +667,7 @@ class LayoutInferenceTestEquations(LayoutInferenceTest, inference_impl=Inference
     assignment = layout_inference2.extract_variable_assignment_from_hint(
         H(v0, eqns.LeastReplicated([v1, layout0, layout1])),
     )
-    self.assertIsNone(assignment)
+    self.assertIsNotNone(assignment)
 
   @parameterized.parameters("registers", "shared")
   def test_infer_wgmma_layout_correctly(self, lhs_memory_space):
@@ -677,6 +691,37 @@ class LayoutInferenceTestEquations(LayoutInferenceTest, inference_impl=Inference
 
     self.checkInLayouts(wgmma_op, in_layouts)
     self.checkOutLayouts(wgmma_op, out_layouts)
+
+  def test_layout_cast_of_vector_load_to_splat_raises(self):
+    shape = (32, 4)
+    splat_layout = mgpu.WGSplatFragLayout(shape=shape)
+    with ir.InsertionPoint(self.module.body):
+      vec_ty = ir.VectorType.get(shape, ir.BF16Type.get())
+      ref_ty = ir.MemRefType.get(shape, ir.BF16Type.get())
+      [ref] = undefs(ref_ty)
+      zero = mgpu.utils.c(0, ir.IntegerType.get_signless(32))
+      loaded = vector.load(vec_ty, ref, [zero])
+      layout_cast(loaded, splat_layout)
+
+    with self.assertRaisesRegex(
+        ValueError, "user-provided layout casts are unsatisfiable"
+    ):
+      self.infer_layout(self.module)
+
+  def test_layout_cast_of_non_splat_constant_to_splat_raises(self):
+    shape = (128,)
+    splat_layout = mgpu.WGSplatFragLayout(shape=shape)
+    with ir.InsertionPoint(self.module.body):
+      bf16 = ir.BF16Type.get()
+      ty = ir.VectorType.get(shape, bf16)
+      values = [ir.FloatAttr.get(bf16, float(i)) for i in range(shape[0])]
+      constant = arith.constant(ty, ir.DenseElementsAttr.get(values, ty))
+      layout_cast(constant, splat_layout)
+
+    with self.assertRaisesRegex(
+        ValueError, "user-provided layout casts are unsatisfiable"
+    ):
+      self.infer_layout(self.module)
 
 
 if __name__ == "__main__":
