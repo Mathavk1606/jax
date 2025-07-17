@@ -39,6 +39,7 @@ import numpy as np
 
 SMEM = tpu_core.MemorySpace.SMEM
 VMEM = tpu_core.MemorySpace.VMEM
+ANY = tpu_core.MemorySpace.ANY
 REF = pallas_core.MemoryRef
 GridDimensionSemantics = tpu_core.GridDimensionSemantics
 PARALLEL = tpu_core.PARALLEL
@@ -540,7 +541,8 @@ class BufferedRef(BufferedRefBase):
   def create(cls, spec: pl.BlockSpec, dtype, buffer_type, buffer_count,
              needs_swap_ref=True,
              grid_rank=None,
-             use_lookahead=False) -> BufferedRef:
+             use_lookahead=False,
+             source_memory_space: tpu_core.MemorySpace = ANY) -> BufferedRef:
     """Create a BufferedRef.
 
     Args:
@@ -551,6 +553,7 @@ class BufferedRef(BufferedRefBase):
       needs_swap_ref: whether a swap slots tracker needs to be allocated.
       grid_rank: rank of the pipeline grid.
       use_lookahead: whether to enable pipeline lookahead.
+      source_memory_space: The memory space of the backing source Ref.
 
     Returns:
       Initialized BufferedRef
@@ -560,10 +563,13 @@ class BufferedRef(BufferedRefBase):
       accum_ref = VMEM(block_shape, dtype)
     else:
       accum_ref = None
-    if spec.memory_space == VMEM:
+    if source_memory_space == VMEM:
       # We don't need to do any double-buffering in the case that our pipeline
       # reference is already in VMEM, we just need allocate the accumulation
       # buffer and we will refer to the original reference slices directly.
+      if spec.memory_space != VMEM:
+        raise ValueError(
+            f"Cannot hold a non-buffered ref in {spec.memory_space=}")
       return cls(
           _spec=spec,
           dtype=dtype,
@@ -585,7 +591,12 @@ class BufferedRef(BufferedRefBase):
           swap=None,
       )
     else:
-      memory_space = SMEM if spec.memory_space == SMEM else VMEM
+      buffer_memory_space = (
+          VMEM if spec.memory_space is None else spec.memory_space)
+      if buffer_memory_space not in (SMEM, VMEM):
+        raise ValueError(
+            f"Unsupported buffer memory space: {spec.memory_space}"
+        )
       if use_lookahead and grid_rank is None:
         raise ValueError(
             "grid_rank must be specified when use_lookahead is True."
@@ -594,7 +605,7 @@ class BufferedRef(BufferedRefBase):
           _spec=spec,
           dtype=dtype,
           _buffer_type=buffer_type,
-          window_ref=memory_space((buffer_count,) + block_shape, dtype),
+          window_ref=buffer_memory_space((buffer_count,) + block_shape, dtype),
           accum_ref=accum_ref,
           copy_in_slot=SMEM((1,), jnp.uint32) if buffer_type.is_input else None,
           wait_in_slot=SMEM((1,), jnp.uint32) if buffer_type.is_input else None,
@@ -621,26 +632,22 @@ class BufferedRef(BufferedRefBase):
       )
 
   @classmethod
-  def input(cls, spec, dtype, buffer_count=2, needs_swap_ref=True,
-            grid_rank=None, use_lookahead=False):
-    return cls.create(spec, dtype, BufferType.INPUT, buffer_count,
-                      needs_swap_ref, grid_rank=grid_rank,
-                      use_lookahead=use_lookahead)
+  def input(cls, spec, dtype, buffer_count=2, **kwargs):
+    return cls.create(spec, dtype, BufferType.INPUT, buffer_count, **kwargs)
 
   @classmethod
-  def output(cls, spec, dtype, buffer_count=2, needs_swap_ref=True):
-    return cls.create(spec, dtype, BufferType.OUTPUT, buffer_count,
-                      needs_swap_ref)
+  def output(cls, spec, dtype, buffer_count=2, **kwargs):
+    return cls.create(spec, dtype, BufferType.OUTPUT, buffer_count, **kwargs)
 
   @classmethod
-  def accumulator(cls, spec, dtype, buffer_count=2, needs_swap_ref=True):
+  def accumulator(cls, spec, dtype, buffer_count=2, **kwargs):
     return cls.create(spec, dtype, BufferType.ACCUMULATOR, buffer_count,
-                      needs_swap_ref)
+                      **kwargs)
 
   @classmethod
-  def input_output(cls, spec, dtype, buffer_count=2, needs_swap_ref=True):
+  def input_output(cls, spec, dtype, buffer_count=2, **kwargs):
     return cls.create(spec, dtype, BufferType.INPUT_OUTPUT, buffer_count,
-                      needs_swap_ref)
+                      **kwargs)
 
   @property
   def block_shape(self):
@@ -1693,8 +1700,10 @@ def make_pipeline_allocations(
     if in_spec.pipeline_mode is not None:
       buffer_count = in_spec.pipeline_mode.buffer_count
     return BufferedRef.input(in_spec, in_ref.dtype, buffer_count,
-                             needs_swap_ref, grid_rank=len(grid),
-                             use_lookahead=use_lookahead)
+                             needs_swap_ref=needs_swap_ref,
+                             grid_rank=len(grid),
+                             use_lookahead=use_lookahead,
+                             source_memory_space=in_ref.memory_space)
   in_brefs = jax.tree.map(make_input_bref, in_specs, in_refs)
   def make_output_bref(out_spec, out_ref, accumulate):
     buffer_count = 2
@@ -1702,10 +1711,12 @@ def make_pipeline_allocations(
       buffer_count = out_spec.pipeline_mode.buffer_count
 
     if accumulate:
-      return BufferedRef.accumulator(out_spec, out_ref.dtype,
-                                     buffer_count, needs_swap_ref)
-    return BufferedRef.output(out_spec, out_ref.dtype,
-                              buffer_count, needs_swap_ref)
+      return BufferedRef.accumulator(out_spec, out_ref.dtype, buffer_count,
+                                     needs_swap_ref=needs_swap_ref,
+                                     source_memory_space=out_ref.memory_space)
+    return BufferedRef.output(out_spec, out_ref.dtype, buffer_count,
+                              needs_swap_ref=needs_swap_ref,
+                              source_memory_space=out_ref.memory_space)
   out_brefs = jax.tree.map(
       make_output_bref, out_specs, out_refs, should_accumulate_out)
   return (*in_brefs, *out_brefs)
