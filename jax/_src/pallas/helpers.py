@@ -97,11 +97,16 @@ def loop(
     lower: jax.typing.ArrayLike,
     upper: jax.typing.ArrayLike,
     *,
+    step: jax.typing.ArrayLike = 1,
     unroll: int | bool | None = None,
 ) -> Callable[[Callable[[jax.Array], None]], None]:
   def decorator(body):
     jax.lax.fori_loop(
-        lower, upper, lambda idx, _: body(idx), init_val=None, unroll=unroll
+        lower,
+        jax.lax.div(upper, step),
+        lambda idx, _: body(idx * step),
+        init_val=None,
+        unroll=unroll,
     )
 
   return decorator
